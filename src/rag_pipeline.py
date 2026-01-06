@@ -1,59 +1,51 @@
-import pandas as pd
-from sklearn.model_selection import train_test_split
-from langchain.text_splitter import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
+from transformers import pipeline
 import chromadb
-from tqdm import tqdm
 
-# Load cleaned data
-df = pd.read_csv("data/processed/filtered_complaints.csv")
+# Load embedding model
+embed_model = SentenceTransformer("all-MiniLM-L6-v2")
 
-# Stratified sampling
-sample_df, _ = train_test_split(
-    df,
-    train_size=12000,
-    stratify=df["product"],
-    random_state=42
-)
-
-print("Sample size:", sample_df.shape)
-
-# Chunking
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50
-)
-
-documents = []
-metadatas = []
-
-for _, row in tqdm(sample_df.iterrows(), total=len(sample_df)):
-    chunks = splitter.split_text(row["cleaned_narrative"])
-    for i, chunk in enumerate(chunks):
-        documents.append(chunk)
-        metadatas.append({
-            "complaint_id": row["complaint_id"],
-            "product": row["product"],
-            "chunk_index": i
-        })
-
-# Embeddings
-model = SentenceTransformer("all-MiniLM-L6-v2")
-embeddings = model.encode(documents, show_progress_bar=True)
-
-# Vector store
+# Load vector store
 client = chromadb.Client(
     chromadb.config.Settings(persist_directory="vector_store")
 )
+collection = client.get_collection("complaints")
 
-collection = client.get_or_create_collection(name="complaints")
-
-collection.add(
-    documents=documents,
-    embeddings=embeddings.tolist(),
-    metadatas=metadatas,
-    ids=[str(i) for i in range(len(documents))]
+# Load LLM
+llm = pipeline(
+    "text-generation",
+    model="mistralai/Mistral-7B-Instruct",
+    max_new_tokens=300
 )
 
-client.persist()
-print("Vector store saved to vector_store/")
+PROMPT_TEMPLATE = """
+You are a financial analyst assistant for CrediTrust.
+Answer the question ONLY using the context below.
+If the answer is not in the context, say you do not have enough information.
+
+Context:
+{context}
+
+Question:
+{question}
+
+Answer:
+"""
+
+def rag_answer(question, k=5):
+    query_embedding = embed_model.encode([question])
+
+    results = collection.query(
+        query_embeddings=query_embedding.tolist(),
+        n_results=k
+    )
+
+    context = "\n\n".join(results["documents"][0])
+
+    prompt = PROMPT_TEMPLATE.format(
+        context=context,
+        question=question
+    )
+
+    response = llm(prompt)[0]["generated_text"]
+    return response, results["documents"][0]
